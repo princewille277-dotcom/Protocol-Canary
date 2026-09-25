@@ -54,6 +54,8 @@ struct JsonNetwork {
     name: String,
     #[serde(rename = "observedProtocol", skip_serializing_if = "Option::is_none")]
     observed_protocol: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,6 +143,7 @@ impl From<&ReportInput> for JsonReport {
             network: input.network.as_ref().map(|n| JsonNetwork {
                 name: n.name.to_string(),
                 observed_protocol: n.observed_protocol.map(|p| p.0),
+                error: n.error.clone(),
             }),
             status: input.overall_status().as_str().to_string(),
             counts: JsonCounts::from_results(&input.results, input.skipped.len()),
@@ -180,6 +183,8 @@ impl From<&ReportInput> for JsonReport {
 pub enum JsonReportError {
     #[error("failed to parse JSON report: {0}")]
     Parse(#[from] serde_json::Error),
+    #[error("unsupported schema version (found {found}, expected {expected})")]
+    UnsupportedSchemaVersion { found: u32, expected: u32 },
     #[error("unrecognized surface {0:?} in JSON report")]
     UnknownSurface(String),
     #[error("unrecognized status {0:?} in JSON report")]
@@ -280,6 +285,7 @@ impl TryFrom<JsonReport> for ReportInput {
             network: report.network.map(|n| NetworkSummary {
                 name: parse_network_name(&n.name),
                 observed_protocol: n.observed_protocol.map(ProtocolVersion),
+                error: n.error,
             }),
             results,
             skipped,
@@ -309,6 +315,12 @@ impl JsonReporter {
     /// anything.
     pub fn parse(json_text: &str) -> Result<ReportInput, JsonReportError> {
         let report: JsonReport = serde_json::from_str(json_text)?;
+        if report.schema_version != SCHEMA_VERSION {
+            return Err(JsonReportError::UnsupportedSchemaVersion {
+                found: report.schema_version,
+                expected: SCHEMA_VERSION,
+            });
+        }
         report.try_into()
     }
 }
@@ -333,6 +345,7 @@ mod tests {
             network: Some(NetworkSummary {
                 name: NetworkName::Testnet,
                 observed_protocol: Some(ProtocolVersion(28)),
+                error: None,
             }),
             results: vec![CompatibilityResult {
                 test_id: "p28-xdr-1".into(),
@@ -485,5 +498,21 @@ mod tests {
 
         let err = JsonReporter::parse(&json_text).unwrap_err();
         assert!(matches!(err, JsonReportError::UnknownStatus(status) if status == "inconclusive"));
+    }
+
+    #[test]
+    fn rejects_a_report_with_an_unsupported_schema_version() {
+        let mut json = serde_json::to_value(JsonReport::from(&input())).unwrap();
+        json["schemaVersion"] = 999.into();
+        let json_text = serde_json::to_string(&json).unwrap();
+
+        let err = JsonReporter::parse(&json_text).unwrap_err();
+        match err {
+            JsonReportError::UnsupportedSchemaVersion { found, expected } => {
+                assert_eq!(found, 999);
+                assert_eq!(expected, SCHEMA_VERSION);
+            }
+            _ => panic!("Expected UnsupportedSchemaVersion error, got {:?}", err),
+        }
     }
 }
